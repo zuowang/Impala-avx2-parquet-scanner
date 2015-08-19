@@ -92,6 +92,7 @@ class SlotDescriptor {
   bool is_materialized() const { return is_materialized_; }
   bool is_nullable() const { return null_indicator_offset_.bit_mask != 0; }
   int slot_size() const { return slot_size_; }
+  int slot_idx() const { return slot_idx_; }
 
   // Comparison function for ordering slot descriptors by their col_path_.
   // Returns true if 'a' comes before 'b'.

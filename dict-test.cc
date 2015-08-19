@@ -44,8 +44,8 @@ void ValidateDict(const vector<T>& values, int fixed_buffer_byte_size) {
   uint8_t dict_buffer[encoder.dict_encoded_size()];
   encoder.WriteDict(dict_buffer);
 
-  int data_buffer_len = encoder.EstimatedDataEncodedSize();
-  uint8_t data_buffer[data_buffer_len];
+  int data_buffer_len = 64 * 1024 * 1024;
+  uint8_t* data_buffer = new uint8_t[data_buffer_len];
   int data_len = encoder.WriteData(data_buffer, data_buffer_len);
   EXPECT_GT(data_len, 0);
   encoder.ClearIndices();
@@ -79,6 +79,22 @@ TEST(DictTest, TestStrings) {
   values.push_back(sv3);
   values.push_back(sv3);
   values.push_back(sv4);
+
+  ValidateDict(values, -1);
+}
+
+TEST(DictTest, TestStrings2) {
+  vector<StringValue> sv;
+  for (int i = 0; i < 1000; ++i) {
+    char s[50];
+    sprintf(s, "sv%d", i);
+    sv.push_back(StringValue(s));
+  }
+  vector<StringValue> values;
+  for (int i = 0; i < 150000; ++i) {
+    int j = i % 1000;
+    values.push_back(sv[j]);
+  }
 
   ValidateDict(values, -1);
 }

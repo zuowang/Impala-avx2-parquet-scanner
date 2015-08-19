@@ -33,6 +33,16 @@ BooleanVal AndPredicate::GetBooleanVal(ExprContext* context, TupleRow* row) {
   return BooleanVal(true);
 }
 
+SimplePredicate* AndPredicate::CreateSimplePredicates(HdfsScanNode* scan_node) {
+  DCHECK_EQ(children_.size(), 2);
+  SimplePredicate* child0 = children_[0]->CreateSimplePredicates(scan_node);
+  if (!child0) return NULL;
+  SimplePredicate* child1 = children_[1]->CreateSimplePredicates(scan_node);
+  if (!child1) return NULL;
+  SimplePredicate* root = scan_node->runtime_state()->obj_pool()->Add(new AndOperate(child0, child1));
+  return root;
+}
+
 // (<> || true) is true, (false || NULL) is NULL
 BooleanVal OrPredicate::GetBooleanVal(ExprContext* context, TupleRow* row) {
   DCHECK_EQ(children_.size(), 2);
@@ -46,8 +56,18 @@ BooleanVal OrPredicate::GetBooleanVal(ExprContext* context, TupleRow* row) {
   return BooleanVal(false);
 }
 
-// IR codegen for compound and/or predicates.  Compound predicate has non trivial 
-// null handling as well as many branches so this is pretty complicated.  The IR 
+SimplePredicate* OrPredicate::CreateSimplePredicates(HdfsScanNode* scan_node) {
+  DCHECK_EQ(children_.size(), 2);
+  SimplePredicate* child0 = children_[0]->CreateSimplePredicates(scan_node);
+  if (!child0) return NULL;
+  SimplePredicate* child1 = children_[1]->CreateSimplePredicates(scan_node);
+  if (!child1) return NULL;
+  SimplePredicate* root = scan_node->runtime_state()->obj_pool()->Add(new OrOperate(child0, child1));
+  return root;
+}
+
+// IR codegen for compound and/or predicates.  Compound predicate has non trivial
+// null handling as well as many branches so this is pretty complicated.  The IR
 // for x && y is:
 //
 // define i16 @CompoundPredicate(%"class.impala::ExprContext"* %context,
@@ -67,30 +87,30 @@ BooleanVal OrPredicate::GetBooleanVal(ExprContext* context, TupleRow* row) {
 //   %val2 = trunc i8 %3 to i1
 //   %tmp_and = and i1 %val, %val2
 //   br i1 %is_null, label %lhs_null, label %lhs_not_null
-// 
+//
 // lhs_null:                                         ; preds = %entry
 //   br i1 %is_null1, label %null_block, label %lhs_null_rhs_not_null
-// 
+//
 // lhs_not_null:                                     ; preds = %entry
 //   br i1 %is_null1, label %lhs_not_null_rhs_null, label %not_null_block
-// 
+//
 // lhs_null_rhs_not_null:                            ; preds = %lhs_null
 //   br i1 %val2, label %null_block, label %not_null_block
-// 
+//
 // lhs_not_null_rhs_null:                            ; preds = %lhs_not_null
 //   br i1 %val, label %null_block, label %not_null_block
-// 
+//
 // null_block:                                       ; preds = %lhs_null_rhs_not_null,
 //                                                     %lhs_not_null_rhs_null, %lhs_null
 //   br label %ret
-// 
+//
 // not_null_block:                                   ; preds = %lhs_null_rhs_not_null,
 //                                                   %lhs_not_null_rhs_null, %lhs_not_null
 //   %4 = phi i1 [ false, %lhs_null_rhs_not_null ],
 //               [ false, %lhs_not_null_rhs_null ],
 //               [ %tmp_and, %lhs_not_null ]
 //   br label %ret
-// 
+//
 // ret:                                              ; preds = %not_null_block, %null_block
 //   %ret3 = phi i1 [ false, %null_block ], [ %4, %not_null_block ]
 //   %5 = zext i1 %ret3 to i16
@@ -111,7 +131,7 @@ Status CompoundPredicate::CodegenComputeFn(
   RETURN_IF_ERROR(children()[0]->GetCodegendComputeFn(state, &lhs_function));
   Function* rhs_function;
   RETURN_IF_ERROR(children()[1]->GetCodegendComputeFn(state, &rhs_function));
-  
+
   LlvmCodeGen* codegen;
   RETURN_IF_ERROR(state->GetCodegen(&codegen));
   LLVMContext& context = codegen->context();
@@ -124,11 +144,11 @@ Status CompoundPredicate::CodegenComputeFn(
 
   // Control blocks for aggregating results
   BasicBlock* lhs_null_block = BasicBlock::Create(context, "lhs_null", function);
-  BasicBlock* lhs_not_null_block = 
+  BasicBlock* lhs_not_null_block =
       BasicBlock::Create(context, "lhs_not_null", function);
-  BasicBlock* lhs_null_rhs_not_null_block = 
+  BasicBlock* lhs_null_rhs_not_null_block =
       BasicBlock::Create(context, "lhs_null_rhs_not_null", function);
-  BasicBlock* lhs_not_null_rhs_null_block = 
+  BasicBlock* lhs_not_null_rhs_null_block =
       BasicBlock::Create(context, "lhs_not_null_rhs_null", function);
   BasicBlock* null_block = BasicBlock::Create(context, "null_block", function);
   BasicBlock* not_null_block = BasicBlock::Create(context, "not_null_block", function);
@@ -140,7 +160,7 @@ Status CompoundPredicate::CodegenComputeFn(
   // Call rhs
   CodegenAnyVal rhs_result = CodegenAnyVal::CreateCallWrapped(
       codegen, &builder, TYPE_BOOLEAN, rhs_function, args, "rhs_call");
-  
+
   Value* lhs_is_null = lhs_result.GetIsNull();
   Value* rhs_is_null = rhs_result.GetIsNull();
   Value* lhs_value = lhs_result.GetVal();

@@ -16,11 +16,15 @@
 #ifndef IMPALA_EXEC_PARQUET_COMMON_H
 #define IMPALA_EXEC_PARQUET_COMMON_H
 
+#include <boost/dynamic_bitset.hpp>
+
 #include "gen-cpp/Descriptors_types.h"
 #include "gen-cpp/parquet_types.h"
 #include "runtime/decimal-value.h"
 #include "runtime/string-value.h"
 #include "util/bit-util.h"
+
+using namespace boost;
 
 // This file contains common elements between the parquet Writer and Scanner.
 namespace impala {
@@ -178,6 +182,78 @@ class ParquetPlainEncoder {
     return ByteSize(*v);
   }
 
+  template<typename T>
+  static int Decode(uint8_t* buffer, int fixed_len_size, T* v, int skip_rows) {
+    int skip_bytes = ByteSize(*v) * skip_rows;
+    memcpy(v, buffer + skip_bytes, ByteSize(*v));
+    return ByteSize(*v) + skip_bytes;
+  }
+
+  template<typename T>
+  static int Skip(uint8_t* buffer, int fixed_len_size, T* v, int skip_rows) {
+    return ByteSize(*v) * skip_rows;
+  }
+
+  template<typename T>
+  static void Eq(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, T& val) {
+    uint8_t* buf = buffer;
+    int val_bytes = ByteSize(val);
+    for(int i = 0; i < num_rows; ++i) {
+      skip_bitset.push_back(val == *reinterpret_cast<T*>(buf));
+      buf += val_bytes;
+    }
+  }
+
+  template<typename T>
+  static void Lt(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, T& val) {
+    uint8_t* buf = buffer;
+    int val_bytes = ByteSize(val);
+    for(int i = 0; i < num_rows; ++i) {
+      skip_bitset.push_back(val < *reinterpret_cast<T*>(buf));
+      buf += val_bytes;
+    }
+  }
+
+  template<typename T>
+  static void Le(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, T& val) {
+    uint8_t* buf = buffer;
+    int val_bytes = ByteSize(val);
+    for(int i = 0; i < num_rows; ++i) {
+      skip_bitset.push_back(val <= *reinterpret_cast<T*>(buf));
+      buf += val_bytes;
+    }
+  }
+
+  template<typename T>
+  static void Gt(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, T& val) {
+    uint8_t* buf = buffer;
+    int val_bytes = ByteSize(val);
+    for(int i = 0; i < num_rows; ++i) {
+      skip_bitset.push_back(val > *reinterpret_cast<T*>(buf));
+      buf += val_bytes;
+    }
+  }
+
+  template<typename T>
+  static void Ge(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, T& val) {
+    uint8_t* buf = buffer;
+    int val_bytes = ByteSize(val);
+    for(int i = 0; i < num_rows; ++i) {
+      skip_bitset.push_back(val >= *reinterpret_cast<T*>(buf));
+      buf += val_bytes;
+    }
+  }
+
+  template<typename T>
+  static void In(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, std::vector<T>& val) {
+  }
+
   // Encode 't', which must be in the machine endian, to FIXED_LEN_BYTE_ARRAY
   // of 'fixed_len_size'. The result is encoded as big endian.
   template <typename T>
@@ -194,6 +270,19 @@ class ParquetPlainEncoder {
 template<> int ParquetPlainEncoder::ByteSize(const bool& b);
 template<> int ParquetPlainEncoder::Encode(uint8_t*, int fixed_len_size, const bool&);
 template<> int ParquetPlainEncoder::Decode(uint8_t*, int fixed_len_size, bool* v);
+template<> int ParquetPlainEncoder::Decode(uint8_t*, int fixed_len_size, bool* v, int skip_rows);
+template<> int ParquetPlainEncoder::Skip(uint8_t* buffer, int fixed_len_size, bool* v, int skip_rows);
+template<> void ParquetPlainEncoder::Eq(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+                   dynamic_bitset<>& skip_bitset, bool& val);
+template<> void ParquetPlainEncoder::Lt(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+                   dynamic_bitset<>& skip_bitset, bool& val);
+template<> void ParquetPlainEncoder::Le(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+                   dynamic_bitset<>& skip_bitset, bool& val);
+template<> void ParquetPlainEncoder::Gt(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+                   dynamic_bitset<>& skip_bitset, bool& val);
+template<> void ParquetPlainEncoder::Ge(uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+                   dynamic_bitset<>& skip_bitset, bool& val);
+
 
 // Not used for decimals since the plain encoding encodes them using
 // FIXED_LEN_BYTE_ARRAY.
@@ -232,9 +321,131 @@ inline int ParquetPlainEncoder::Decode(uint8_t* buffer, int fixed_len_size, int8
   return ByteSize(*v);
 }
 template<>
+inline int ParquetPlainEncoder::Decode(uint8_t* buffer, int fixed_len_size, int8_t* v,
+    int skip_rows) {
+  int skip_bytes = ByteSize(*v) * skip_rows;
+  *v = *(buffer + skip_bytes);
+  return ByteSize(*v) + skip_bytes;
+}
+template<>
+inline int ParquetPlainEncoder::Skip(uint8_t* buffer, int fixed_len_size, int8_t* v, int skip_rows) {
+  return ByteSize(*v) * skip_rows;
+}
+template<>
+inline void ParquetPlainEncoder::Eq(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int8_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val == *reinterpret_cast<int8_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Lt(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int8_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val < *reinterpret_cast<int8_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Le(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int8_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val <= *reinterpret_cast<int8_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Gt(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int8_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val > *reinterpret_cast<int8_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Ge(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int8_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val >= *reinterpret_cast<int8_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
 inline int ParquetPlainEncoder::Decode(uint8_t* buffer, int fixed_len_size, int16_t* v) {
   memcpy(v, buffer, sizeof(int16_t));
   return ByteSize(*v);
+}
+template<>
+inline int ParquetPlainEncoder::Decode(uint8_t* buffer, int fixed_len_size, int16_t* v,
+    int skip_rows) {
+  int skip_bytes = ByteSize(*v) * skip_rows;
+  memcpy(v, buffer + skip_bytes, sizeof(int16_t));
+  return ByteSize(*v) + skip_bytes;
+}
+template<>
+inline int ParquetPlainEncoder::Skip(uint8_t* buffer, int fixed_len_size, int16_t* v, int skip_rows) {
+  return ByteSize(*v) * skip_rows;
+}
+template<>
+inline void ParquetPlainEncoder::Eq(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int16_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val == *reinterpret_cast<int16_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Lt(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int16_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val < *reinterpret_cast<int16_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Le(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int16_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val <= *reinterpret_cast<int16_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Gt(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int16_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val > *reinterpret_cast<int16_t*>(buf));
+    buf += val_bytes;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Ge(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, int16_t& val) {
+  uint8_t* buf = buffer;
+  int val_bytes = ByteSize(val);
+  for(int i = 0; i < num_rows; ++i) {
+    skip_bitset.push_back(val >= *reinterpret_cast<int16_t*>(buf));
+    buf += val_bytes;
+  }
 }
 
 template<>
@@ -272,6 +483,99 @@ inline int ParquetPlainEncoder::Decode(
   return bytesize;
 }
 
+template<>
+inline int ParquetPlainEncoder::Decode(
+    uint8_t* buffer, int fixed_len_size, StringValue* v, int skip_rows) {
+  int skip_bytes = 0;
+  while (skip_rows > 0) {
+    memcpy(&v->len, buffer + skip_bytes, sizeof(int32_t));
+    skip_bytes += ByteSize(*v);
+    --skip_rows;
+  }
+  memcpy(&v->len, buffer + skip_bytes, sizeof(int32_t));
+  v->ptr = reinterpret_cast<char*>(buffer) + sizeof(int32_t);
+  skip_bytes += ByteSize(*v);
+  if (fixed_len_size > 0) v->len = std::min(v->len, fixed_len_size);
+  // we still read bytesize bytes, even if we truncate
+  return skip_bytes;
+}
+template<>
+inline int ParquetPlainEncoder::Skip(uint8_t* buffer, int fixed_len_size, StringValue* v, int skip_rows) {
+  int total_bytesize = 0;
+  int32_t len = 0;
+  while (skip_rows > 0) {
+    memcpy(&len, buffer + total_bytesize, sizeof(int32_t));
+    total_bytesize += len + sizeof(int32_t);
+    --skip_rows;
+  }
+
+  return total_bytesize;
+}
+template<>
+inline void ParquetPlainEncoder::Eq(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, StringValue& val) {
+  uint8_t* buf = buffer;
+  StringValue v;
+  for(int i = 0; i < num_rows; ++i) {
+    memcpy(&v.len, buf, sizeof(int32_t));
+    v.ptr = reinterpret_cast<char*>(buf) + sizeof(int32_t);
+    buf += ByteSize(v);
+    if (fixed_len_size > 0) v.len = std::min(v.len, fixed_len_size);
+    skip_bitset.push_back(val == v);
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Lt(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, StringValue& val) {
+  uint8_t* buf = buffer;
+  StringValue v;
+  for(int i = 0; i < num_rows; ++i) {
+    memcpy(&v.len, buf, sizeof(int32_t));
+    v.ptr = reinterpret_cast<char*>(buf) + sizeof(int32_t);
+    buf += ByteSize(v);
+    if (fixed_len_size > 0) v.len = std::min(v.len, fixed_len_size);
+    skip_bitset.push_back(val < v);
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Le(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, StringValue& val) {
+  uint8_t* buf = buffer;
+  StringValue v;
+  for(int i = 0; i < num_rows; ++i) {
+    memcpy(&v.len, buf, sizeof(int32_t));
+    v.ptr = reinterpret_cast<char*>(buf) + sizeof(int32_t);
+    buf += ByteSize(v);
+    if (fixed_len_size > 0) v.len = std::min(v.len, fixed_len_size);
+    skip_bitset.push_back(val <= v);
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Gt(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, StringValue& val) {
+  uint8_t* buf = buffer;
+  StringValue v;
+  for(int i = 0; i < num_rows; ++i) {
+    memcpy(&v.len, buf, sizeof(int32_t));
+    v.ptr = reinterpret_cast<char*>(buf) + sizeof(int32_t);
+    buf += ByteSize(v);
+    if (fixed_len_size > 0) v.len = std::min(v.len, fixed_len_size);
+    skip_bitset.push_back(val > v);
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Ge(uint8_t* buffer, int fixed_len_size,
+    int64_t num_rows, dynamic_bitset<>& skip_bitset, StringValue& val) {
+  uint8_t* buf = buffer;
+  StringValue v;
+  for(int i = 0; i < num_rows; ++i) {
+    memcpy(&v.len, buf, sizeof(int32_t));
+    v.ptr = reinterpret_cast<char*>(buf) + sizeof(int32_t);
+    buf += ByteSize(v);
+    if (fixed_len_size > 0) v.len = std::min(v.len, fixed_len_size);
+    skip_bitset.push_back(val >= v);
+  }
+}
 // Write decimals as big endian (byte comparable) to benefit from common prefixes.
 // fixed_len_size can be less than sizeof(Decimal*Value) for space savings. This means
 // that the value in the in-memory format has leading zeros or negative 1's.
@@ -304,6 +608,78 @@ inline int ParquetPlainEncoder::Decode(
   DecimalUtil::DecodeFromFixedLenByteArray(buffer, fixed_len_size, v);
   return fixed_len_size;
 }
+template<>
+inline int ParquetPlainEncoder::Decode(
+    uint8_t* buffer, int fixed_len_size, Decimal4Value* v, int skip_rows) {
+  int skip_bytes = skip_rows * fixed_len_size;
+  DecimalUtil::DecodeFromFixedLenByteArray(buffer + skip_bytes, fixed_len_size, v);
+  return fixed_len_size + skip_bytes;
+}
+template<>
+inline int ParquetPlainEncoder::Skip(uint8_t* buffer, int fixed_len_size,
+    Decimal4Value* v, int skip_rows) {
+  return fixed_len_size * skip_rows;
+}
+template<>
+inline void ParquetPlainEncoder::Eq(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal4Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal4Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v == val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Lt(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal4Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal4Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v < val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Le(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal4Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal4Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v <= val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Gt(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal4Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal4Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v > val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Ge(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal4Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal4Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v >= val);
+    buf += fixed_len_size;
+  }
+}
 
 template<>
 inline int ParquetPlainEncoder::Decode(
@@ -311,12 +687,156 @@ inline int ParquetPlainEncoder::Decode(
   DecimalUtil::DecodeFromFixedLenByteArray(buffer, fixed_len_size, v);
   return fixed_len_size;
 }
+template<>
+inline int ParquetPlainEncoder::Decode(
+    uint8_t* buffer, int fixed_len_size, Decimal8Value* v, int skip_rows) {
+  int skip_bytes = skip_rows * fixed_len_size;
+  DecimalUtil::DecodeFromFixedLenByteArray(buffer + skip_bytes, fixed_len_size, v);
+  return fixed_len_size + skip_bytes;
+}
+template<>
+inline int ParquetPlainEncoder::Skip(uint8_t* buffer, int fixed_len_size,
+    Decimal8Value* v, int skip_rows) {
+  return fixed_len_size * skip_rows;
+}
+template<>
+inline void ParquetPlainEncoder::Eq(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal8Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal8Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v == val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Lt(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal8Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal8Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v < val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Le(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal8Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal8Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v <= val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Gt(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal8Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal8Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v > val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Ge(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal8Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal8Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v >= val);
+    buf += fixed_len_size;
+  }
+}
 
 template<>
 inline int ParquetPlainEncoder::Decode(
     uint8_t* buffer, int fixed_len_size, Decimal16Value* v) {
   DecimalUtil::DecodeFromFixedLenByteArray(buffer, fixed_len_size, v);
   return fixed_len_size;
+}
+template<>
+inline int ParquetPlainEncoder::Decode(
+    uint8_t* buffer, int fixed_len_size, Decimal16Value* v, int skip_rows) {
+  int skip_bytes = skip_rows * fixed_len_size;
+  DecimalUtil::DecodeFromFixedLenByteArray(buffer + skip_bytes, fixed_len_size, v);
+  return fixed_len_size + skip_bytes;
+}
+template<>
+inline int ParquetPlainEncoder::Skip(uint8_t* buffer, int fixed_len_size,
+    Decimal16Value* v, int skip_rows) {
+  return fixed_len_size * skip_rows;
+}
+template<>
+inline void ParquetPlainEncoder::Eq(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal16Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal16Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v == val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Lt(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal16Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal16Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v < val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Le(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal16Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal16Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v <= val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Gt(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal16Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal16Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v > val);
+    buf += fixed_len_size;
+  }
+}
+template<>
+inline void ParquetPlainEncoder::Ge(
+    uint8_t* buffer, int fixed_len_size, int64_t num_rows,
+    dynamic_bitset<>& skip_bitset, Decimal16Value& val) {
+  uint8_t* buf = buffer;
+  for (int i = 0; i < num_rows; ++i) {
+    Decimal16Value v;
+    DecimalUtil::DecodeFromFixedLenByteArray(buf, fixed_len_size, &v);
+    skip_bitset.push_back(v >= val);
+    buf += fixed_len_size;
+  }
 }
 
 }

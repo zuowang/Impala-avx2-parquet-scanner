@@ -207,15 +207,15 @@ LIB_JAVA=`find ${JAVA_HOME}/   -name libjava.so | head -1`
 LIB_JSIG=`find ${JAVA_HOME}/   -name libjsig.so | head -1`
 LIB_JVM=` find ${JAVA_HOME}/   -name libjvm.so  | head -1`
 LIB_HDFS=`find ${HADOOP_HOME}/ -name libhdfs.so | head -1`
-LD_LIBRARY_PATH="${LD_LIBRARY_PATH-}"
-LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:`dirname ${LIB_JAVA}`:`dirname ${LIB_JSIG}`"
-LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:`dirname ${LIB_JVM}`:`dirname ${LIB_HDFS}`"
-LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${IMPALA_HOME}/be/build/debug/service"
-LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${IMPALA_HOME}/thirdparty/snappy-${IMPALA_SNAPPY_VERSION}/build/lib"
-LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$IMPALA_LZO/build"
-export LD_LIBRARY_PATH
-LD_PRELOAD="${LD_PRELOAD-}"
-export LD_PRELOAD="${LD_PRELOAD}:${LIB_JSIG}"
+#LD_LIBRARY_PATH="${LD_LIBRARY_PATH-}"
+#LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:`dirname ${LIB_JAVA}`:`dirname ${LIB_JSIG}`"
+#LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:`dirname ${LIB_JVM}`:`dirname ${LIB_HDFS}`"
+#LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${IMPALA_HOME}/be/build/debug/service"
+#LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${IMPALA_HOME}/thirdparty/snappy-${IMPALA_SNAPPY_VERSION}/build/lib"
+#LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$IMPALA_LZO/build"
+#export LD_LIBRARY_PATH
+#LD_PRELOAD="${LD_PRELOAD-}"
+#export LD_PRELOAD="${LD_PRELOAD}:${LIB_JSIG}"
 
 CLASSPATH="${CLASSPATH-}"
 CLASSPATH=$IMPALA_FE_DIR/target/dependency:$CLASSPATH

@@ -213,6 +213,15 @@ enum Encoding {
   /** Dictionary encoding: the ids are encoded using the RLE encoding
    */
   RLE_DICTIONARY = 8;
+
+  /** Fixed length encoding. Usable for definition/repetition levels
+   * encoding and Booleans.
+   */
+  FLE = 9;
+
+  /** Dictionary encoding: the ids are encoded using the FLE encoding
+   */
+  FLE_DICTIONARY = 10;
 }
 
 /**

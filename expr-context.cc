@@ -336,3 +336,8 @@ TimestampVal ExprContext::GetTimestampVal(TupleRow* row) {
 DecimalVal ExprContext::GetDecimalVal(TupleRow* row) {
   return root_->GetDecimalVal(this, row);
 }
+
+SimplePredicate* ExprContext::CreateSimplePredicates(HdfsScanNode* scan_node) {
+  return root_->CreateSimplePredicates(scan_node);
+}
+

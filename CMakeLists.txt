@@ -26,6 +26,7 @@ enable_testing()
 PROJECT(ASSEMBLER)
 
 # compiler flags that are common across debug/release builds
+#  - msse4.2: Enable sse4.2 compiler intrinsics.
 #  - Wall: Enable all warnings.
 #  - Wno-sign-compare: suppress warnings for comparison between signed and unsigned
 #    integers
@@ -35,7 +36,7 @@ PROJECT(ASSEMBLER)
 #  - Wno-deprecated: gutil contains deprecated headers
 #  - pthread: enable multithreaded malloc
 #  - DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG: enable nanosecond precision for boost
-SET(CXX_COMMON_FLAGS "-Wall -Wno-sign-compare -Wno-unknown-pragmas -pthread")
+SET(CXX_COMMON_FLAGS "-msse4.2 -Wall -Wno-sign-compare -Wno-unknown-pragmas -pthread")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fno-strict-aliasing")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-deprecated -Wno-unused-local-typedefs")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG")
@@ -49,7 +50,7 @@ SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage")
 #   -O3: Enable all compiler optimizations
 #   -g: Enable symbols for profiler tools
 #   -DNDEBUG: Turn off dchecks/asserts/debug only code.
-SET(CXX_FLAGS_DEBUG "-g -ggdb")
+SET(CXX_FLAGS_DEBUG "-g -ggdb -gdwarf-2")
 SET(CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG")
 SET(CXX_FLAGS_ADDRESS_SANITIZER
     "-O1 -g -fsanitize=address -fno-omit-frame-pointer -DADDRESS_SANITIZER")
@@ -191,6 +192,9 @@ set (IMPALA_LINK_LIBS
   Udf
   Util
   Webserver
+  -Wl,-Bstatic
+  -lboost_date_time
+  -Wl,-Bdynamic
   -Wl,--end-group
 )
 
@@ -238,7 +242,7 @@ set (IMPALA_LINK_LIBS ${IMPALA_LINK_LIBS}
   ${LIBZ}
   ${LIBBZ2}
   ${AVRO_STATIC_LIB}
-  -lrt -lboost_date_time
+  -lrt
 )
 
 

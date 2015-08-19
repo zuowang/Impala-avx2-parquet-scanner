@@ -29,6 +29,7 @@
 #include "util/debug-util.h"
 #include "util/dict-encoding.h"
 #include "util/hdfs-util.h"
+#include "util/fle-encoding.h"
 #include "util/rle-encoding.h"
 #include "rpc/thrift-util.h"
 
@@ -100,7 +101,7 @@ class HdfsParquetTableWriter::BaseColumnWriter {
     Codec::CreateCompressor(NULL, false, codec, &compressor_);
 
     def_levels_ = parent_->state_->obj_pool()->Add(
-        new RleEncoder(parent_->reusable_col_mem_pool_->Allocate(DEFAULT_DATA_PAGE_SIZE),
+        new FleEncoder(parent_->reusable_col_mem_pool_->Allocate(DEFAULT_DATA_PAGE_SIZE),
                        DEFAULT_DATA_PAGE_SIZE, 1));
     values_buffer_ = parent_->reusable_col_mem_pool_->Allocate(values_buffer_len_);
   }
@@ -154,6 +155,30 @@ class HdfsParquetTableWriter::BaseColumnWriter {
  protected:
   friend class HdfsParquetTableWriter;
 
+  struct DataPage {
+    // Page header.  This is a union of all page types.
+    PageHeader header;
+
+    vector<bool> def_levels;
+
+    vector<int> node_indices;
+
+    // Number of bytes needed to store definition levels.
+    int num_def_bytes;
+
+    // This is the payload for the data page.  This includes the definition/repetition
+    // levels data and the encoded values.  If compression is enabled, this is the
+    // compressed data.
+    uint8_t* data;
+
+    // If true, this data page has been finalized.  All sizes are computed, header is
+    // fully populated and any compression is done.
+    bool finalized;
+
+    // Number of non-null values
+    int num_non_null;
+  };
+
   // Encode value into the current page output buffer. Returns true if the value fits
   // on the current page. If this function returned false, the caller should create a
   // new page and try again with the same value.
@@ -171,25 +196,7 @@ class HdfsParquetTableWriter::BaseColumnWriter {
   // Writes out the dictionary encoded data buffered in dict_encoder_.
   void WriteDictDataPage();
 
-  struct DataPage {
-    // Page header.  This is a union of all page types.
-    PageHeader header;
-
-    // Number of bytes needed to store definition levels.
-    int num_def_bytes;
-
-    // This is the payload for the data page.  This includes the definition/repetition
-    // levels data and the encoded values.  If compression is enabled, this is the
-    // compressed data.
-    uint8_t* data;
-
-    // If true, this data page has been finalized.  All sizes are computed, header is
-    // fully populated and any compression is done.
-    bool finalized;
-
-    // Number of non-null values
-    int num_non_null;
-  };
+  void WriteDictDataPage(DataPage& page);
 
   HdfsParquetTableWriter* parent_;
   ExprContext* expr_ctx_;
@@ -225,7 +232,7 @@ class HdfsParquetTableWriter::BaseColumnWriter {
   // this always uses 1 bit per row.
   // This is reused across pages since the underlying buffer is copied out when
   // the page is finalized.
-  RleEncoder* def_levels_;
+  FleEncoder* def_levels_;
 
   // Data for buffered values. This is reused across pages.
   uint8_t* values_buffer_;
@@ -249,7 +256,7 @@ class HdfsParquetTableWriter::ColumnWriter :
     BaseColumnWriter::Reset();
     // Default to dictionary encoding.  If the cardinality ends up being too high,
     // it will fall back to plain.
-    current_encoding_ = Encoding::PLAIN_DICTIONARY;
+    current_encoding_ = Encoding::FLE_DICTIONARY;
     dict_encoder_.reset(
         new DictEncoder<T>(parent_->per_file_mem_pool_.get(), encoded_value_size_));
     dict_encoder_base_ = dict_encoder_.get();
@@ -257,14 +264,13 @@ class HdfsParquetTableWriter::ColumnWriter :
 
  protected:
   virtual bool EncodeValue(void* value, int64_t* bytes_needed) {
-    if (current_encoding_ == Encoding::PLAIN_DICTIONARY) {
+    if (current_encoding_ == Encoding::PLAIN_DICTIONARY || current_encoding_ == Encoding::FLE_DICTIONARY) {
       if (UNLIKELY(num_values_since_dict_size_check_ >=
                    DICTIONARY_DATA_PAGE_SIZE_CHECK_PERIOD)) {
         num_values_since_dict_size_check_ = 0;
-        if (dict_encoder_->EstimatedDataEncodedSize() >= page_size_) return false;
       }
       ++num_values_since_dict_size_check_;
-      *bytes_needed = dict_encoder_->Put(*CastValue(value));
+      *bytes_needed = dict_encoder_->Put(*CastValue(value), current_page_->node_indices);
       // If the dictionary contains the maximum number of values, switch to plain
       // encoding.  The current dictionary encoded page is written out.
       if (UNLIKELY(*bytes_needed < 0)) {
@@ -376,11 +382,22 @@ inline Status HdfsParquetTableWriter::BaseColumnWriter::AppendRow(TupleRow* row)
 
   // We might need to try again if this current page is not big enough
   while (true) {
-    if (!def_levels_->Put(value != NULL)) {
-      FinalizeCurrentPage();
-      NewPage();
-      bool ret = def_levels_->Put(value != NULL);
-      DCHECK(ret);
+    if (current_encoding_ == Encoding::PLAIN_DICTIONARY ||
+        current_encoding_ == Encoding::FLE_DICTIONARY) {
+      if (UNLIKELY(current_page_->def_levels.size() > DEFAULT_DATA_PAGE_SIZE * 8 - 64)) {
+        FinalizeCurrentPage();
+        NewPage();
+        current_page_->def_levels.push_back(value != NULL);
+      } else {
+        current_page_->def_levels.push_back(value != NULL);
+      }
+    } else if (current_encoding_ == Encoding::PLAIN) {
+      if (!def_levels_->Put(value != NULL)) {
+        FinalizeCurrentPage();
+        NewPage();
+        bool ret = def_levels_->Put(value != NULL);
+        DCHECK(ret);
+      }
     }
 
     // Nulls don't get encoded.
@@ -430,6 +447,22 @@ inline void HdfsParquetTableWriter::BaseColumnWriter::WriteDictDataPage() {
   current_page_->header.uncompressed_page_size = len;
 }
 
+inline void HdfsParquetTableWriter::BaseColumnWriter::WriteDictDataPage(DataPage& page) {
+  DCHECK(dict_encoder_base_ != NULL);
+  DCHECK_EQ(page.header.uncompressed_page_size, 0);
+  if (page.num_non_null == 0) return;
+  int len = dict_encoder_base_->WriteData(
+      values_buffer_, values_buffer_len_, page.node_indices);
+  while (UNLIKELY(len < 0)) {
+    // len < 0 indicates the data doesn't fit into a data page. Allocate a larger data
+    // page.
+    values_buffer_len_ *= 2;
+    values_buffer_ = parent_->reusable_col_mem_pool_->Allocate(values_buffer_len_);
+    len = dict_encoder_base_->WriteData(values_buffer_, values_buffer_len_, page.node_indices);
+  }
+  page.header.uncompressed_page_size = len;
+}
+
 Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
    int64_t* first_data_page, int64_t* first_dictionary_page) {
   if (current_page_ == NULL) {
@@ -448,7 +481,7 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
     // Write dictionary page header
     DictionaryPageHeader dict_header;
     dict_header.num_values = dict_encoder_base_->num_entries();
-    dict_header.encoding = Encoding::PLAIN_DICTIONARY;
+    dict_header.encoding = Encoding::FLE_DICTIONARY;
 
     PageHeader header;
     header.type = PageType::DICTIONARY_PAGE;
@@ -497,6 +530,7 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
   // Write data pages
   for (int i = 0; i < num_data_pages_; ++i) {
     DataPage& page = pages_[i];
+    PageHeader& header = page.header;
 
     // Last page might be empty
     if (page.header.data_page_header.num_values == 0) {
@@ -505,9 +539,68 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
       continue;
     }
 
+    if (header.data_page_header.encoding == Encoding::PLAIN_DICTIONARY ||
+        header.data_page_header.encoding == Encoding::FLE_DICTIONARY) {
+      WriteDictDataPage(page);
+
+      // Compute size of definition bits
+      for (int i = 0; i < page.def_levels.size(); ++i) {
+        bool ret = def_levels_->Put(page.def_levels[i]);
+        DCHECK(ret);
+      }
+      def_levels_->Flush();
+      page.num_def_bytes = sizeof(int32_t) + def_levels_->len();
+      header.uncompressed_page_size += page.num_def_bytes;
+
+      // At this point we know all the data for the data page.  Combine them into one buffer.
+      uint8_t* uncompressed_data = NULL;
+      if (compressor_.get() == NULL) {
+        uncompressed_data =
+            parent_->per_file_mem_pool_->Allocate(header.uncompressed_page_size);
+      } else {
+        // We have compression.  Combine into the staging buffer.
+        parent_->compression_staging_buffer_.resize(
+            header.uncompressed_page_size);
+        uncompressed_data = &parent_->compression_staging_buffer_[0];
+      }
+
+      BufferBuilder buffer(uncompressed_data, header.uncompressed_page_size);
+
+      // Copy the definition (null) data
+      int num_def_level_bytes = def_levels_->len();
+
+      buffer.Append(num_def_level_bytes);
+      buffer.Append(def_levels_->buffer(), num_def_level_bytes);
+      // TODO: copy repetition data when we support nested types.
+      buffer.Append(values_buffer_, buffer.capacity() - buffer.size());
+
+      // Apply compression if necessary
+      if (compressor_.get() == NULL) {
+        page.data = reinterpret_cast<uint8_t*>(uncompressed_data);
+        header.compressed_page_size = header.uncompressed_page_size;
+      } else {
+        SCOPED_TIMER(parent_->parent_->compress_timer());
+        int64_t max_compressed_size =
+            compressor_->MaxOutputLen(header.uncompressed_page_size);
+        DCHECK_GT(max_compressed_size, 0);
+        uint8_t* compressed_data = parent_->per_file_mem_pool_->Allocate(max_compressed_size);
+        header.compressed_page_size = max_compressed_size;
+        compressor_->ProcessBlock32(true, header.uncompressed_page_size, uncompressed_data,
+            &header.compressed_page_size, &compressed_data);
+        page.data = compressed_data;
+
+        // We allocated the output based on the guessed size, return the extra allocated
+        // bytes back to the mem pool.
+        parent_->per_file_mem_pool_->ReturnPartialAllocation(
+            max_compressed_size - header.compressed_page_size);
+      }
+
+      def_levels_->Clear();
+    }
+
     // Write data page header
-    uint8_t* buffer;
-    uint32_t len;
+    uint8_t* buffer = NULL;
+    uint32_t len = 0;
     RETURN_IF_ERROR(
         parent_->thrift_serializer_->Serialize(&page.header, &len, &buffer));
     RETURN_IF_ERROR(parent_->Write(buffer, len));
@@ -516,6 +609,12 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
     // Write the page data
     RETURN_IF_ERROR(parent_->Write(page.data, page.header.compressed_page_size));
     *file_pos += page.header.compressed_page_size;
+
+    if (header.data_page_header.encoding == Encoding::PLAIN_DICTIONARY ||
+        header.data_page_header.encoding == Encoding::FLE_DICTIONARY) {
+      total_compressed_byte_size_ += len + page.header.compressed_page_size;
+      total_uncompressed_byte_size_ += len + page.header.uncompressed_page_size;
+    }
   }
   return Status::OK;
 }
@@ -524,75 +623,91 @@ void HdfsParquetTableWriter::BaseColumnWriter::FinalizeCurrentPage() {
   DCHECK(current_page_ != NULL);
   if (current_page_->finalized) return;
 
+  if (current_encoding_ == Encoding::FLE_DICTIONARY &&
+      current_page_->num_non_null == 0) {
+    // Compute size of definition bits
+    for (int i = 0; i < current_page_->def_levels.size(); ++i) {
+      bool ret = def_levels_->Put(current_page_->def_levels[i]);
+      DCHECK(ret);
+    }
+  }
+
   // If the entire page was NULL, encode it as PLAIN since there is no
   // data anyway. We don't output a useless dictionary page and it works
   // around a parquet MR bug (see IMPALA-759 for more details).
   if (current_page_->num_non_null == 0) current_encoding_ = Encoding::PLAIN;
 
-  if (current_encoding_ == Encoding::PLAIN_DICTIONARY) WriteDictDataPage();
-
   PageHeader& header = current_page_->header;
   header.data_page_header.encoding = current_encoding_;
 
-  // Compute size of definition bits
-  def_levels_->Flush();
-  current_page_->num_def_bytes = sizeof(int32_t) + def_levels_->len();
-  header.uncompressed_page_size += current_page_->num_def_bytes;
+  if (current_encoding_ == Encoding::PLAIN) {
+    // Compute size of definition bits
+    def_levels_->Flush();
+    current_page_->num_def_bytes = sizeof(int32_t) + def_levels_->len();
+    header.uncompressed_page_size += current_page_->num_def_bytes;
 
-  // At this point we know all the data for the data page.  Combine them into one buffer.
-  uint8_t* uncompressed_data = NULL;
-  if (compressor_.get() == NULL) {
-    uncompressed_data =
-        parent_->per_file_mem_pool_->Allocate(header.uncompressed_page_size);
-  } else {
-    // We have compression.  Combine into the staging buffer.
-    parent_->compression_staging_buffer_.resize(
-        header.uncompressed_page_size);
-    uncompressed_data = &parent_->compression_staging_buffer_[0];
+    // At this point we know all the data for the data page.  Combine them into one buffer.
+    uint8_t* uncompressed_data = NULL;
+    if (compressor_.get() == NULL) {
+      uncompressed_data =
+          parent_->per_file_mem_pool_->Allocate(header.uncompressed_page_size);
+    } else {
+      // We have compression.  Combine into the staging buffer.
+      parent_->compression_staging_buffer_.resize(
+          header.uncompressed_page_size);
+      uncompressed_data = &parent_->compression_staging_buffer_[0];
+    }
+
+    BufferBuilder buffer(uncompressed_data, header.uncompressed_page_size);
+
+    // Copy the definition (null) data
+    int num_def_level_bytes = def_levels_->len();
+
+    buffer.Append(num_def_level_bytes);
+    buffer.Append(def_levels_->buffer(), num_def_level_bytes);
+    // TODO: copy repetition data when we support nested types.
+    buffer.Append(values_buffer_, buffer.capacity() - buffer.size());
+
+    // Apply compression if necessary
+    if (compressor_.get() == NULL) {
+      current_page_->data = reinterpret_cast<uint8_t*>(uncompressed_data);
+      header.compressed_page_size = header.uncompressed_page_size;
+    } else {
+      SCOPED_TIMER(parent_->parent_->compress_timer());
+      int64_t max_compressed_size =
+          compressor_->MaxOutputLen(header.uncompressed_page_size);
+      DCHECK_GT(max_compressed_size, 0);
+      uint8_t* compressed_data = parent_->per_file_mem_pool_->Allocate(max_compressed_size);
+      header.compressed_page_size = max_compressed_size;
+      compressor_->ProcessBlock32(true, header.uncompressed_page_size, uncompressed_data,
+          &header.compressed_page_size, &compressed_data);
+      current_page_->data = compressed_data;
+
+      // We allocated the output based on the guessed size, return the extra allocated
+      // bytes back to the mem pool.
+      parent_->per_file_mem_pool_->ReturnPartialAllocation(
+          max_compressed_size - header.compressed_page_size);
+    }
+
+    // Add the size of the data page header
+    uint8_t* header_buffer;
+    uint32_t header_len = 0;
+    parent_->thrift_serializer_->Serialize(
+        &current_page_->header, &header_len, &header_buffer);
+
+    total_compressed_byte_size_ += header_len + header.compressed_page_size;
+    total_uncompressed_byte_size_ += header_len + header.uncompressed_page_size;
+    parent_->file_size_estimate_ += header_len + header.compressed_page_size;
+    def_levels_->Clear();
   }
 
-  BufferBuilder buffer(uncompressed_data, header.uncompressed_page_size);
-
-  // Copy the definition (null) data
-  int num_def_level_bytes = def_levels_->len();
-
-  buffer.Append(num_def_level_bytes);
-  buffer.Append(def_levels_->buffer(), num_def_level_bytes);
-  // TODO: copy repetition data when we support nested types.
-  buffer.Append(values_buffer_, buffer.capacity() - buffer.size());
-
-  // Apply compression if necessary
-  if (compressor_.get() == NULL) {
-    current_page_->data = reinterpret_cast<uint8_t*>(uncompressed_data);
-    header.compressed_page_size = header.uncompressed_page_size;
-  } else {
-    SCOPED_TIMER(parent_->parent_->compress_timer());
-    int64_t max_compressed_size =
-        compressor_->MaxOutputLen(header.uncompressed_page_size);
-    DCHECK_GT(max_compressed_size, 0);
-    uint8_t* compressed_data = parent_->per_file_mem_pool_->Allocate(max_compressed_size);
-    header.compressed_page_size = max_compressed_size;
-    compressor_->ProcessBlock32(true, header.uncompressed_page_size, uncompressed_data,
-        &header.compressed_page_size, &compressed_data);
-    current_page_->data = compressed_data;
-
-    // We allocated the output based on the guessed size, return the extra allocated
-    // bytes back to the mem pool.
-    parent_->per_file_mem_pool_->ReturnPartialAllocation(
-        max_compressed_size - header.compressed_page_size);
+  if (current_encoding_ == Encoding::PLAIN_DICTIONARY ||
+      current_encoding_ == Encoding::FLE_DICTIONARY) {
+    parent_->file_size_estimate_ += current_page_->node_indices.size() * 2 +
+        current_page_->def_levels.size() / 8 + sizeof(header);
   }
-
-  // Add the size of the data page header
-  uint8_t* header_buffer;
-  uint32_t header_len = 0;
-  parent_->thrift_serializer_->Serialize(
-      &current_page_->header, &header_len, &header_buffer);
 
   current_page_->finalized = true;
-  total_compressed_byte_size_ += header_len + header.compressed_page_size;
-  total_uncompressed_byte_size_ += header_len + header.uncompressed_page_size;
-  parent_->file_size_estimate_ += header_len + header.compressed_page_size;
-  def_levels_->Clear();
 }
 
 void HdfsParquetTableWriter::BaseColumnWriter::NewPage() {
@@ -602,13 +717,15 @@ void HdfsParquetTableWriter::BaseColumnWriter::NewPage() {
     current_page_->header.data_page_header.num_values = 0;
     current_page_->header.compressed_page_size = 0;
     current_page_->header.uncompressed_page_size = 0;
+    current_page_->def_levels.clear();
+    current_page_->node_indices.clear();
   } else {
     pages_.push_back(DataPage());
     current_page_ = &pages_[num_data_pages_++];
 
     DataPageHeader header;
     header.num_values = 0;
-    header.definition_level_encoding = Encoding::RLE;
+    header.definition_level_encoding = Encoding::FLE;
     header.repetition_level_encoding = Encoding::BIT_PACKED;
     current_page_->header.__set_data_page_header(header);
   }
@@ -777,10 +894,10 @@ Status HdfsParquetTableWriter::AddRowGroup() {
     metadata.type = IMPALA_TO_PARQUET_TYPES[columns_[i]->expr_ctx_->root()->type().type];
     // Add all encodings that were used in this file.  Currently we use PLAIN and
     // PLAIN_DICTIONARY for data values and RLE for the definition levels.
-    metadata.encodings.push_back(Encoding::RLE);
+    metadata.encodings.push_back(Encoding::FLE);
     // Columns are initially dictionary encoded
     // TODO: we might not have PLAIN encoding in this case
-    metadata.encodings.push_back(Encoding::PLAIN_DICTIONARY);
+    metadata.encodings.push_back(Encoding::FLE_DICTIONARY);
     metadata.encodings.push_back(Encoding::PLAIN);
     metadata.path_in_schema.push_back(table_desc_->col_names()[i + num_clustering_cols]);
     metadata.codec = columns_[i]->codec();
@@ -961,8 +1078,8 @@ Status HdfsParquetTableWriter::FlushCurrentRowGroup() {
     // Metadata for this column is complete, write it out to file.  The column metadata
     // goes at the end so that when we have collocated files, the column data can be
     // written without buffering.
-    uint32_t len;
-    uint8_t* buffer;
+    uint32_t len = 0;
+    uint8_t* buffer = NULL;
     RETURN_IF_ERROR(
         thrift_serializer_->Serialize(&current_row_group_->columns[i], &len, &buffer));
     RETURN_IF_ERROR(Write(buffer, len));

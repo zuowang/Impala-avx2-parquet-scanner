@@ -16,12 +16,15 @@
 #ifndef IMPALA_EXEC_HDFS_PARQUET_SCANNER_H
 #define IMPALA_EXEC_HDFS_PARQUET_SCANNER_H
 
+#include <boost/dynamic_bitset.hpp>
+
 #include "exec/hdfs-scanner.h"
 #include "exec/parquet-common.h"
 
 namespace impala {
 
 struct HdfsFileDesc;
+class SimplePredicate;
 
 // This scanner parses Parquet files located in HDFS, and writes the
 // content as tuples in the Impala in-memory representation of data, e.g.
@@ -85,6 +88,20 @@ class HdfsParquetScanner : public HdfsScanner {
     bool VersionEq(int major, int minor, int patch) const;
   };
 
+  template<typename T>
+  void Eq(int idx, int64_t num_rows, boost::dynamic_bitset<>& skip_bitset, T& val);
+  template<typename T>
+  void Lt(int idx, int64_t num_rows, boost::dynamic_bitset<>& skip_bitset, T& val);
+  template<typename T>
+  void Le(int idx, int64_t num_rows, boost::dynamic_bitset<>& skip_bitset, T& val);
+  template<typename T>
+  void Gt(int idx, int64_t num_rows, boost::dynamic_bitset<>& skip_bitset, T& val);
+  template<typename T>
+  void Ge(int idx, int64_t num_rows, boost::dynamic_bitset<>& skip_bitset, T& val);
+  template<typename T>
+  void In(int idx, int64_t num_rows, boost::dynamic_bitset<>& skip_bitset, vector<T>& val);
+
+  void Eq(){}
  private:
   // Internal representation of a column schema (including nested-type columns).
   struct SchemaNode {
@@ -149,12 +166,16 @@ class HdfsParquetScanner : public HdfsScanner {
   // Number of cols that need to be read.
   RuntimeProfile::Counter* num_cols_counter_;
 
+  vector<SimplePredicate*> simple_predicates_;
+
+  bool conjunct_check_;
+
   // Reads data from all the columns (in parallel) and assembles rows into the context
   // object. Returns when the entire row group is complete or an error occurred.
   Status AssembleRows(int row_group_idx);
 
   // Process the file footer and parse file_metadata_.  This should be called with the
-  // last FOOTER_SIZE bytes in context_.
+
   // *eosr is a return value.  If true, the scan range is complete (e.g. select count(*))
   Status ProcessFooter(bool* eosr);
 
@@ -192,6 +213,10 @@ class HdfsParquetScanner : public HdfsScanner {
   // Recursive implementation used internally by the above CreateSchemaTree() function.
   Status CreateSchemaTree(const std::vector<parquet::SchemaElement>& schema,
       int max_def_level, int* idx, int* col_idx, SchemaNode* node) const;
+
+  void CreateSimplePredicates();
+
+  bool EvalSimplePredicates(boost::dynamic_bitset<>& skip_bitset);
 };
 
 } // namespace impala

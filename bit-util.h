@@ -20,7 +20,6 @@
 
 #include "common/compiler-util.h"
 #include "util/cpu-info.h"
-#include "util/sse-util.h"
 
 namespace impala {
 
@@ -113,7 +112,7 @@ class BitUtil {
   // Returns the number of set bits in x
   static inline int Popcount(uint64_t x) {
     if (LIKELY(CpuInfo::IsSupported(CpuInfo::POPCNT))) {
-      return POPCNT_popcnt_u64(x);
+      return __builtin_popcountl(x);
     } else {
       return PopcountNoHw(x);
     }

@@ -19,12 +19,16 @@
 #include <string>
 
 #include "exprs/expr.h"
+#include "exprs/literal.h"
+#include "exprs/slot-ref.h"
+#include "exprs/simple-predicates.h"
 #include "udf/udf.h"
 
 using namespace impala_udf;
 
 namespace impala {
 
+class Literal;
 class TExprNode;
 
 // Expr for evaluating a pre-compiled native or LLVM IR function that uses the UDF
@@ -74,6 +78,8 @@ class ScalarFnCall: public Expr {
   virtual TimestampVal GetTimestampVal(ExprContext* context, TupleRow*);
   virtual DecimalVal GetDecimalVal(ExprContext* context, TupleRow*);
 
+  virtual SimplePredicate* CreateSimplePredicates(HdfsScanNode* scan_node);
+
  private:
   // If this function has var args, children()[vararg_start_idx_] is the first vararg
   // argument.
@@ -100,6 +106,7 @@ class ScalarFnCall: public Expr {
 
   // Returns the number of non-vararg arguments
   int NumFixedArgs() const {
+    EqOperate<int> eq(0, 0);
     return vararg_start_idx_ >= 0 ? vararg_start_idx_ : children_.size();
   }
 
@@ -119,6 +126,9 @@ class ScalarFnCall: public Expr {
   // Function to call scalar_fn_. Used in the interpreted path.
   template<typename RETURN_TYPE>
   RETURN_TYPE InterpretEval(ExprContext* context, TupleRow* row);
+
+  template<typename T>
+  SimplePredicate* CreateOperate(HdfsScanNode* scan_node, SlotRef* slotref, vector<T>& val);
 };
 
 }

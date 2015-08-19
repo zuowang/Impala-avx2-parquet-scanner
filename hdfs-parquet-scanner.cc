@@ -26,6 +26,8 @@
 #include "exec/scanner-context.inline.h"
 #include "exec/read-write-util.h"
 #include "exprs/expr.h"
+#include "exprs/expr-context.h"
+#include "exprs/simple-predicates.h"
 #include "runtime/descriptors.h"
 #include "runtime/runtime-state.h"
 #include "runtime/mem-pool.h"
@@ -40,6 +42,7 @@
 #include "util/debug-util.h"
 #include "util/error-util.h"
 #include "util/dict-encoding.h"
+#include "util/fle-encoding.h"
 #include "util/rle-encoding.h"
 #include "util/runtime-profile.h"
 #include "rpc/thrift-util.h"
@@ -124,7 +127,8 @@ HdfsParquetScanner::HdfsParquetScanner(HdfsScanNode* scan_node, RuntimeState* st
     : HdfsScanner(scan_node, state),
       metadata_range_(NULL),
       dictionary_pool_(new MemPool(scan_node->mem_tracker())),
-      assemble_rows_timer_(scan_node_->materialize_tuple_timer()) {
+      assemble_rows_timer_(scan_node_->materialize_tuple_timer()),
+      conjunct_check_(false) {
   assemble_rows_timer_.Stop();
 }
 
@@ -171,6 +175,10 @@ class HdfsParquetScanner::BaseColumnReader {
     if (metadata_ == NULL) return THdfsCompression::NONE;
     return PARQUET_TO_IMPALA_CODEC[metadata_->codec];
   }
+  int64_t num_buffered_values() const { return num_buffered_values_; }
+  void num_buffered_values(int64_t fetched_rows) {
+    num_buffered_values_ -= fetched_rows;
+  }
 
   // Read the next value into tuple for this column.  Returns false if there are no
   // more values in the file.
@@ -184,11 +192,12 @@ class HdfsParquetScanner::BaseColumnReader {
   // one call.  e.g. MaterializeCol would write out 1024 values.  Our row batches
   // are currently dense so we'll need to figure out something there.
   bool ReadValue(MemPool* pool, Tuple* tuple, bool* conjuncts_failed);
+  bool ReadValue(MemPool* pool, Tuple* tuple, int skip_rows);
+  bool SkipValue(int skip_rows);
 
   // TODO: Some encodings might benefit a lot from a SkipValues(int num_rows) if
   // we know this row can be skipped. This could be very useful with stats and big
   // sections can be skipped. Implement that when we can benefit from it.
-
  protected:
   friend class HdfsParquetScanner;
 
@@ -213,6 +222,7 @@ class HdfsParquetScanner::BaseColumnReader {
 
   // Decoder for definition.  Only one of these is valid at a time, depending on
   // the data page metadata.
+  scoped_ptr<FleDecoder> fle_def_levels_;
   RleDecoder rle_def_levels_;
   BitReader bit_packed_def_levels_;
 
@@ -249,6 +259,7 @@ class HdfsParquetScanner::BaseColumnReader {
 
     RuntimeState* state = parent_->scan_node_->runtime_state();
     bitmap_filter_ = state->GetBitmapFilter(slot_desc()->id());
+    parent_->conjunct_check_ = parent_->conjunct_check_ || bitmap_filter_ != NULL;
     hash_seed_ = state->fragment_hash_seed();
     rows_returned_ = 0;
     bitmap_filter_rows_rejected_ = 0;
@@ -261,6 +272,8 @@ class HdfsParquetScanner::BaseColumnReader {
   // Returns the definition level for the next value
   // Returns -1 if there was a error parsing it.
   int ReadDefinitionLevel();
+
+  int ReadDefinitionLevel(int skip_rows);
 
   // Creates a dictionary decoder from values/size. Subclass must implement this
   // and set dict_decoder_base_.
@@ -276,6 +289,16 @@ class HdfsParquetScanner::BaseColumnReader {
   // Subclass must implement this.
   // TODO: we need to remove this with codegen.
   virtual bool ReadSlot(void* slot, MemPool* pool, bool* conjuncts_failed) = 0;
+
+  virtual bool ReadSlot(void* slot, MemPool* pool, int skip_rows) {
+    DCHECK(false);
+    return false;
+  }
+
+  virtual bool SkipSlot(int skip_rows) {
+    DCHECK(false);
+    return false;
+  }
 };
 
 // Per column type reader.
@@ -300,6 +323,127 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
         parent->file_version_.application == "parquet-mr");
   }
 
+  void IntersectBitset(dynamic_bitset<>& root_bitset, dynamic_bitset<>& sub_bitset) {
+    int j = -1;
+    for (int i = 0; i < root_bitset.size(); ++i) {
+      if (root_bitset[i]) root_bitset[i] = sub_bitset[++j];
+    }
+  }
+
+  void Eq(int64_t num_rows, dynamic_bitset<>& skip_bitset, T& val) {
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+      if (max_def_level() == 0) {
+        dict_decoder_->Eq(num_rows, skip_bitset, val);
+        return;
+      }
+      fle_def_levels_->Eq(num_rows, skip_bitset, max_def_level());
+      dynamic_bitset<> data_bitset;
+      dict_decoder_->Eq(skip_bitset.count(), data_bitset, val);
+      IntersectBitset(skip_bitset, data_bitset);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      ParquetPlainEncoder::Eq<T>(data_, fixed_len_size_, num_rows, skip_bitset, val);
+    }
+  }
+
+  void Lt(int64_t num_rows, dynamic_bitset<>& skip_bitset, T& val) {
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+      if (max_def_level() == 0) {
+        dict_decoder_->Lt(num_rows, skip_bitset, val);
+        return;
+      }
+      fle_def_levels_->Eq(num_rows, skip_bitset, max_def_level());
+      dynamic_bitset<> data_bitset;
+      dict_decoder_->Lt(skip_bitset.count(), data_bitset, val);
+      IntersectBitset(skip_bitset, data_bitset);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      ParquetPlainEncoder::Lt<T>(data_, fixed_len_size_, num_rows, skip_bitset, val);
+    }
+  }
+
+  void Le(int64_t num_rows, dynamic_bitset<>& skip_bitset, T& val) {
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+      if (max_def_level() == 0) {
+        dict_decoder_->Le(num_rows, skip_bitset, val);
+        return;
+      }
+      fle_def_levels_->Eq(num_rows, skip_bitset, max_def_level());
+      dynamic_bitset<> data_bitset;
+      dict_decoder_->Le(skip_bitset.count(), data_bitset, val);
+      IntersectBitset(skip_bitset, data_bitset);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      ParquetPlainEncoder::Le<T>(data_, fixed_len_size_, num_rows, skip_bitset, val);
+    }
+  }
+
+  void Gt(int64_t num_rows, dynamic_bitset<>& skip_bitset, T& val) {
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+      if (max_def_level() == 0) {
+        dict_decoder_->Gt(num_rows, skip_bitset, val);
+        return;
+      }
+      fle_def_levels_->Eq(num_rows, skip_bitset, max_def_level());
+      dynamic_bitset<> data_bitset;
+      dict_decoder_->Gt(skip_bitset.count(), data_bitset, val);
+      IntersectBitset(skip_bitset, data_bitset);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      ParquetPlainEncoder::Gt<T>(data_, fixed_len_size_, num_rows, skip_bitset, val);
+    }
+  }
+
+  void Ge(int64_t num_rows, dynamic_bitset<>& skip_bitset, T& val) {
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+    if (max_def_level() == 0) {
+      dict_decoder_->Ge(num_rows, skip_bitset, val);
+      return;
+    }
+    fle_def_levels_->Eq(num_rows, skip_bitset, max_def_level());
+    dynamic_bitset<> data_bitset;
+    dict_decoder_->Ge(skip_bitset.count(), data_bitset, val);
+    IntersectBitset(skip_bitset, data_bitset);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      ParquetPlainEncoder::Ge<T>(data_, fixed_len_size_, num_rows, skip_bitset, val);
+    }
+  }
+
+  void In(int64_t num_rows, dynamic_bitset<>& skip_bitset, vector<T>& vals) {
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+    if (max_def_level() == 0) {
+      dict_decoder_->In(num_rows, skip_bitset, vals);
+      return;
+    }
+    fle_def_levels_->Eq(num_rows, skip_bitset, max_def_level());
+    dynamic_bitset<> data_bitset;
+    dict_decoder_->In(skip_bitset.count(), data_bitset, vals);
+    IntersectBitset(skip_bitset, data_bitset);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      ParquetPlainEncoder::In<T>(data_, fixed_len_size_, num_rows, skip_bitset, vals);
+    }
+  }
+
  protected:
   virtual void CreateDictionaryDecoder(uint8_t* values, int size) {
     dict_decoder_.reset(new DictDecoder<T>(values, size, fixed_len_size_));
@@ -308,7 +452,9 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
 
   virtual Status InitDataPage(uint8_t* data, int size) {
     if (current_page_header_.data_page_header.encoding ==
-          parquet::Encoding::PLAIN_DICTIONARY) {
+          parquet::Encoding::PLAIN_DICTIONARY ||
+          current_page_header_.data_page_header.encoding ==
+          parquet::Encoding::FLE_DICTIONARY) {
       if (dict_decoder_.get() == NULL) {
         return Status("File corrupt. Missing dictionary page.");
       }
@@ -331,7 +477,8 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
     bool result = true;
     T val;
     T* val_ptr = needs_conversion_ ? &val : reinterpret_cast<T*>(slot);
-    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY) {
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
       result = dict_decoder_->GetValue(val_ptr);
     } else {
       DCHECK(page_encoding == parquet::Encoding::PLAIN);
@@ -343,6 +490,58 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
       uint32_t h = RawValue::GetHashValue(slot, slot_desc()->type(), hash_seed_);
       *conjuncts_failed = !bitmap_filter_->Get<true>(h);
       ++bitmap_filter_rows_rejected_;
+    }
+    return result;
+  }
+
+  virtual bool ReadSlot(void* slot, MemPool* pool)  {
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    bool result = true;
+    T val;
+    T* val_ptr = needs_conversion_ ? &val : reinterpret_cast<T*>(slot);
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+      result = dict_decoder_->GetValue(val_ptr);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      data_ += ParquetPlainEncoder::Decode<T>(data_, fixed_len_size_, val_ptr);
+    }
+    if (needs_conversion_) ConvertSlot(&val, reinterpret_cast<T*>(slot), pool);
+    ++rows_returned_;
+    return result;
+  }
+
+  virtual bool ReadSlot(void* slot, MemPool* pool, int skip_rows)  {
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    bool result = true;
+    T val;
+    T* val_ptr = needs_conversion_ ? &val : reinterpret_cast<T*>(slot);
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+      result = dict_decoder_->GetValue(val_ptr, skip_rows);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      data_ += ParquetPlainEncoder::Decode<T>(data_, fixed_len_size_, val_ptr, skip_rows);
+    }
+    if (needs_conversion_) ConvertSlot(&val, reinterpret_cast<T*>(slot), pool);
+    ++rows_returned_;
+    return result;
+  }
+
+  virtual bool SkipSlot(int skip_rows) {
+    if (skip_rows <= 0) return true;
+    parquet::Encoding::type page_encoding =
+        current_page_header_.data_page_header.encoding;
+    bool result = true;
+    if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY ||
+        page_encoding == parquet::Encoding::FLE_DICTIONARY) {
+      result = dict_decoder_->SkipValue(skip_rows);
+    } else {
+      DCHECK(page_encoding == parquet::Encoding::PLAIN);
+      T* val_ptr = NULL;
+      data_ += ParquetPlainEncoder::Skip<T>(data_, fixed_len_size_, val_ptr, skip_rows);
     }
     return result;
   }
@@ -366,6 +565,7 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
   // the max length for VARCHAR columns. Unused otherwise.
   int fixed_len_size_;
 };
+
 
 template<>
 void HdfsParquetScanner::ColumnReader<StringValue>::CopySlot(
@@ -618,7 +818,8 @@ Status HdfsParquetScanner::BaseColumnReader::ReadDataPage() {
       }
       if (dict_header != NULL &&
           dict_header->encoding != parquet::Encoding::PLAIN &&
-          dict_header->encoding != parquet::Encoding::PLAIN_DICTIONARY) {
+          dict_header->encoding != parquet::Encoding::PLAIN_DICTIONARY &&
+          dict_header->encoding != parquet::Encoding::FLE_DICTIONARY) {
         return Status("Only PLAIN and PLAIN_DICTIONARY encodings are supported "
             "for dictionary pages.");
       }
@@ -690,6 +891,14 @@ Status HdfsParquetScanner::BaseColumnReader::ReadDataPage() {
           rle_def_levels_ = RleDecoder(data_, num_definition_bytes, bit_width);
           break;
         }
+        case parquet::Encoding::FLE: {
+          if (!ReadWriteUtil::Read(&data_, &data_size, &num_definition_bytes, &status)) {
+            return status;
+          }
+          int bit_width = BitUtil::Log2(max_def_level() + 1);
+          fle_def_levels_.reset(new FleDecoder(data_, num_definition_bytes, bit_width));
+          break;
+        }
         case parquet::Encoding::BIT_PACKED:
           num_definition_bytes = BitUtil::Ceil(num_buffered_values_, 8);
           bit_packed_def_levels_ = BitReader(data_, num_definition_bytes);
@@ -732,6 +941,36 @@ inline int HdfsParquetScanner::BaseColumnReader::ReadDefinitionLevel() {
       valid = bit_packed_def_levels_.GetValue(1, &definition_level);
       break;
     }
+    case parquet::Encoding::FLE:
+      valid = fle_def_levels_->Get(&definition_level);
+      break;
+    default:
+      DCHECK(false);
+  }
+  if (!valid) return -1;
+  return definition_level;
+}
+
+inline int HdfsParquetScanner::BaseColumnReader::ReadDefinitionLevel(int skip_rows) {
+  if (max_def_level() == 0) {
+    // This column and any containing structs are required so there is nothing encoded for
+    // the definition levels.
+    return 1;
+  }
+
+  uint8_t definition_level;
+  bool valid = false;
+  switch (current_page_header_.data_page_header.definition_level_encoding) {
+    case parquet::Encoding::RLE:
+      valid = rle_def_levels_.Get(&definition_level);
+      break;
+    case parquet::Encoding::BIT_PACKED: {
+      valid = bit_packed_def_levels_.GetValue(1, &definition_level);
+      break;
+    }
+    case parquet::Encoding::FLE:
+      valid = fle_def_levels_->Get(&definition_level, skip_rows);
+      break;
     default:
       DCHECK(false);
   }
@@ -764,6 +1003,40 @@ inline bool HdfsParquetScanner::BaseColumnReader::ReadValue(
   return ReadSlot(tuple->GetSlot(slot_desc()->tuple_offset()), pool, conjuncts_failed);
 }
 
+inline bool HdfsParquetScanner::BaseColumnReader::ReadValue(
+    MemPool* pool, Tuple* tuple, int skip_rows) {
+  int tmp_skip_rows = 0;
+  for (int  i = 0; i < skip_rows; ++i) {
+    int definition_level = ReadDefinitionLevel();
+    if (definition_level < 0) return false;
+    if (definition_level != max_def_level()) continue;
+    ++tmp_skip_rows;
+  }
+
+  int definition_level = ReadDefinitionLevel();
+  if (definition_level < 0) return false;
+
+  if (definition_level != max_def_level()) {
+    // Null value
+    DCHECK_LT(definition_level, max_def_level());
+    tuple->SetNull(slot_desc()->null_indicator_offset());
+    if (!SkipSlot(tmp_skip_rows)) return false;
+    return true;
+  }
+  return ReadSlot(tuple->GetSlot(slot_desc()->tuple_offset()), pool, tmp_skip_rows);
+}
+
+inline bool HdfsParquetScanner::BaseColumnReader::SkipValue(int skip_rows) {
+  int tmp_skip_rows = 0;
+  for (int  i = 0; i < skip_rows; ++i) {
+    int definition_level = ReadDefinitionLevel();
+    if (definition_level < 0) return false;
+    if (definition_level != max_def_level()) continue;
+    ++tmp_skip_rows;
+  }
+  return SkipSlot(tmp_skip_rows);
+}
+
 Status HdfsParquetScanner::ProcessSplit() {
   // First process the file metadata in the footer
   bool eosr;
@@ -773,6 +1046,8 @@ Status HdfsParquetScanner::ProcessSplit() {
   // We've processed the metadata and there are columns that need to be materialized.
   RETURN_IF_ERROR(CreateColumnReaders());
   COUNTER_SET(num_cols_counter_, static_cast<int64_t>(column_readers_.size()));
+
+  CreateSimplePredicates();
 
   // The scanner-wide stream was used only to read the file footer.  Each column has added
   // its own stream.
@@ -809,6 +1084,10 @@ Status HdfsParquetScanner::AssembleRows(int row_group_idx) {
   bool cancelled = context_->cancelled();
   int num_column_readers = column_readers_.size();
   MemPool* pool;
+  dynamic_bitset<> skip_bitset;
+  vector<int> skip_rows;
+  int current_idx = 0;
+  int last_skip_rows = 0;
 
   while (!reached_limit && !cancelled && rows_read < expected_rows_in_group) {
     Tuple* tuple;
@@ -819,43 +1098,127 @@ Status HdfsParquetScanner::AssembleRows(int row_group_idx) {
 
     int num_to_commit = 0;
     if (num_column_readers > 0) {
-      for (int i = 0; i < num_rows; ++i) {
-        bool conjuncts_failed = false;
-        InitTuple(template_tuple_, tuple);
-        for (int c = 0; c < num_column_readers; ++c) {
-          if (!column_readers_[c]->ReadValue(pool, tuple, &conjuncts_failed)) {
-            assemble_rows_timer_.Stop();
-            // This column is complete and has no more data.  This indicates
-            // we are done with this row group.
-            // For correctly formed files, this should be the first column we
-            // are reading.
-            DCHECK(c == 0 || !parse_status_.ok())
-              << "c=" << c << " " << parse_status_.GetDetail();;
-            COUNTER_ADD(scan_node_->rows_read_counter(), i);
-            RETURN_IF_ERROR(CommitRows(num_to_commit));
+      if (simple_predicates_.size() != 0) {
+        num_rows = 0;
+        bool result = true;
 
-            // If we reach this point, it means that we reached the end of file for
-            // this column. Test if the expected number of rows from metadata matches
-            // the actual number of rows in the file.
-            rows_read += i;
-            if (rows_read != expected_rows_in_group) {
-              HdfsParquetScanner::BaseColumnReader* reader = column_readers_[c];
-              DCHECK_NOTNULL(reader->stream_);
-
-              ErrorMsg msg(TErrorCode::PARQUET_GROUP_ROW_COUNT_ERROR,
-                 reader->stream_->filename(), row_group_idx,
-                 expected_rows_in_group, rows_read);
-              LOG_OR_RETURN_ON_ERROR(msg, scan_node_->runtime_state());
+        while (num_to_commit < row_mem_limit) {
+          if (current_idx == skip_rows.size()) {
+            if (last_skip_rows != 0) {
+              for (int c = 0; c < num_column_readers; ++c) {
+                result = column_readers_[c]->SkipValue(last_skip_rows);
+              }
+              num_rows += last_skip_rows;
+              last_skip_rows = 0;
+              if (!result) return parse_status_;
             }
-            return parse_status_;
+            if (num_rows + rows_read >= expected_rows_in_group) {
+              DCHECK(num_rows + rows_read == expected_rows_in_group);
+              break;
+            }
+            skip_bitset.clear();
+            if (!EvalSimplePredicates(skip_bitset)) return parse_status_;
+            if (skip_bitset.size() == 0) {
+              DCHECK(num_rows + rows_read == expected_rows_in_group);
+              break;
+            }
+            if (skip_bitset.count() == 0) {
+              int tmp_skip_rows = skip_bitset.size();
+              for (int c = 0; c < num_column_readers; ++c) {
+                result = column_readers_[c]->SkipValue(tmp_skip_rows);
+              }
+              num_rows += skip_bitset.size();
+              continue;
+            }
+
+            skip_rows.clear();
+            int start = 0;
+            int bitset_size = skip_bitset.size();
+            int sum = 0;
+            for (int i = 0; i < bitset_size; ++i) {
+              if (skip_bitset[i]) {
+                skip_rows.push_back(i - start);
+                sum += i - start + 1;
+                start = i + 1;
+              }
+            }
+            sum += bitset_size - start;
+            DCHECK(sum == bitset_size);
+            last_skip_rows = bitset_size - start;
+            current_idx = 0;
           }
+
+          Tuple* firstTuple = tuple;
+          int rest_rows = row_mem_limit - num_to_commit;
+          int distance_size = skip_rows.size();
+          int current_limited = std::min(distance_size, current_idx + rest_rows);
+          for (int i = current_idx; i < current_limited; ++i) {
+            InitTuple(template_tuple_, tuple);
+            result = column_readers_[0]->ReadValue(pool, tuple, skip_rows[i]);
+            num_rows += skip_rows[i] + 1;
+            tuple = next_tuple(tuple);
+          }
+
+          for (int c = 1; c < num_column_readers; ++c) {
+            tuple = firstTuple;
+            for (int i = current_idx; i < current_limited; ++i) {
+              result = column_readers_[c]->ReadValue(pool, tuple, skip_rows[i]);
+              tuple = next_tuple(tuple);
+            }
+          }
+
+          //TODO Handle error status.
+          if (!result) return parse_status_;
+
+          tuple = firstTuple;
+          for (int i = current_idx; i < current_limited; ++i) {
+            row->SetTuple(scan_node_->tuple_idx(), tuple);
+            row = next_row(row);
+            tuple = next_tuple(tuple);
+            ++num_to_commit;
+          }
+          current_idx = current_limited;
         }
-        if (conjuncts_failed) continue;
-        row->SetTuple(scan_node_->tuple_idx(), tuple);
-        if (EvalConjuncts(row)) {
-          row = next_row(row);
-          tuple = next_tuple(tuple);
-          ++num_to_commit;
+
+      } else {
+        for (int i = 0; i < num_rows; ++i) {
+          bool conjuncts_failed = false;
+          InitTuple(template_tuple_, tuple);
+          for (int c = 0; c < num_column_readers; ++c) {
+            if (!column_readers_[c]->ReadValue(pool, tuple, &conjuncts_failed)) {
+              assemble_rows_timer_.Stop();
+              // This column is complete and has no more data.  This indicates
+              // we are done with this row group.
+              // For correctly formed files, this should be the first column we
+              // are reading.
+              DCHECK(c == 0 || !parse_status_.ok())
+                << "c=" << c << " " << parse_status_.GetDetail();;
+              COUNTER_ADD(scan_node_->rows_read_counter(), i);
+              RETURN_IF_ERROR(CommitRows(num_to_commit));
+
+              // If we reach this point, it means that we reached the end of file for
+              // this column. Test if the expected number of rows from metadata matches
+              // the actual number of rows in the file.
+              rows_read += i;
+              if (rows_read != expected_rows_in_group) {
+                HdfsParquetScanner::BaseColumnReader* reader = column_readers_[c];
+                DCHECK_NOTNULL(reader->stream_);
+
+                ErrorMsg msg(TErrorCode::PARQUET_GROUP_ROW_COUNT_ERROR,
+                   reader->stream_->filename(), row_group_idx,
+                   expected_rows_in_group, rows_read);
+                LOG_OR_RETURN_ON_ERROR(msg, scan_node_->runtime_state());
+              }
+              return parse_status_;
+            }
+          }
+          if (conjuncts_failed) continue;
+          row->SetTuple(scan_node_->tuple_idx(), tuple);
+          if (EvalConjuncts(row)) {
+            row = next_row(row);
+            tuple = next_tuple(tuple);
+            ++num_to_commit;
+          }
         }
       }
     } else {
@@ -1277,6 +1640,8 @@ bool IsEncodingSupported(parquet::Encoding::type e) {
     case parquet::Encoding::PLAIN_DICTIONARY:
     case parquet::Encoding::BIT_PACKED:
     case parquet::Encoding::RLE:
+    case parquet::Encoding::FLE:
+    case parquet::Encoding::FLE_DICTIONARY:
       return true;
     default:
       return false;
@@ -1456,3 +1821,238 @@ string HdfsParquetScanner::SchemaNode::DebugString(int indent) const {
   }
   return ss.str();
 }
+
+void HdfsParquetScanner::CreateSimplePredicates() {
+  for (int i = 0; i < conjunct_ctxs_.size(); ++i) {
+    SimplePredicate* root =
+        conjunct_ctxs_[i]->CreateSimplePredicates(scan_node_);
+    if (!root) {
+      simple_predicates_.clear();
+      break;
+    }
+    simple_predicates_.push_back(root);
+  }
+}
+
+bool HdfsParquetScanner::EvalSimplePredicates(dynamic_bitset<>& skip_bitset) {
+  int64_t limit_rows = 1024;
+  for (int c = 0; c < column_readers_.size(); ++c) {
+    if (column_readers_[c]->num_buffered_values() == 0) {
+      assemble_rows_timer_.Stop();
+      parse_status_ = column_readers_[c]->ReadDataPage();
+      if (column_readers_[c]->num_buffered_values() == 0 || !parse_status_.ok()) {
+        return false;
+      }
+      assemble_rows_timer_.Start();
+    }
+    if (column_readers_[c]->num_buffered_values() < limit_rows) {
+      limit_rows = column_readers_[c]->num_buffered_values();
+    }
+  }
+
+  for (int c = 0; c < column_readers_.size(); ++c) {
+    column_readers_[c]->num_buffered_values(limit_rows);
+  }
+
+  simple_predicates_[0]->GetBitset(this, limit_rows, skip_bitset);
+  for (int i = 1; i < simple_predicates_.size(); ++i) {
+    dynamic_bitset<> tmp_bitset;
+    simple_predicates_[i]->GetBitset(this, limit_rows, tmp_bitset);
+    skip_bitset &= tmp_bitset;
+  }
+  DCHECK(limit_rows == skip_bitset.size());
+  return true;
+}
+
+template<typename T>
+void HdfsParquetScanner::Eq(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, T& val){
+  reinterpret_cast<HdfsParquetScanner::ColumnReader<T>*>(column_readers_[idx])->Eq(
+      num_rows, skip_bitset, val);
+}
+
+template<typename T>
+void HdfsParquetScanner::Lt(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, T& val){
+  reinterpret_cast<HdfsParquetScanner::ColumnReader<T>*>(column_readers_[idx])->Lt(
+      num_rows, skip_bitset, val);
+}
+
+template<typename T>
+void HdfsParquetScanner::Le(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, T& val){
+  reinterpret_cast<HdfsParquetScanner::ColumnReader<T>*>(column_readers_[idx])->Le(
+      num_rows, skip_bitset, val);
+}
+
+template<typename T>
+void HdfsParquetScanner::Gt(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, T& val){
+  reinterpret_cast<HdfsParquetScanner::ColumnReader<T>*>(column_readers_[idx])->Gt(
+      num_rows, skip_bitset, val);
+}
+
+template<typename T>
+void HdfsParquetScanner::Ge(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, T& val){
+  reinterpret_cast<HdfsParquetScanner::ColumnReader<T>*>(column_readers_[idx])->Ge(
+      num_rows, skip_bitset, val);
+}
+
+template<typename T>
+void HdfsParquetScanner::In(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<T>& vals){
+  reinterpret_cast<HdfsParquetScanner::ColumnReader<T>*>(column_readers_[idx])->In(
+      num_rows, skip_bitset, vals);
+}
+
+template void HdfsParquetScanner::Eq<int8_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int8_t& val);
+template void HdfsParquetScanner::Eq<int16_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int16_t& val);
+template void HdfsParquetScanner::Eq<int32_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int32_t& val);
+template void HdfsParquetScanner::Eq<int64_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int64_t& val);
+template void HdfsParquetScanner::Eq<float>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, float& val);
+template void HdfsParquetScanner::Eq<double>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, double& val);
+template void HdfsParquetScanner::Eq<TimestampValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, TimestampValue& val);
+template void HdfsParquetScanner::Eq<StringValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, StringValue& val);
+template void HdfsParquetScanner::Eq<Decimal4Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal4Value& val);
+template void HdfsParquetScanner::Eq<Decimal8Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal8Value& val);
+template void HdfsParquetScanner::Eq<Decimal16Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal16Value& val);
+
+template void HdfsParquetScanner::Lt<int8_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int8_t& val);
+template void HdfsParquetScanner::Lt<int16_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int16_t& val);
+template void HdfsParquetScanner::Lt<int32_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int32_t& val);
+template void HdfsParquetScanner::Lt<int64_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int64_t& val);
+template void HdfsParquetScanner::Lt<float>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, float& val);
+template void HdfsParquetScanner::Lt<double>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, double& val);
+template void HdfsParquetScanner::Lt<TimestampValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, TimestampValue& val);
+template void HdfsParquetScanner::Lt<StringValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, StringValue& val);
+template void HdfsParquetScanner::Lt<Decimal4Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal4Value& val);
+template void HdfsParquetScanner::Lt<Decimal8Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal8Value& val);
+template void HdfsParquetScanner::Lt<Decimal16Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal16Value& val);
+
+template void HdfsParquetScanner::Le<int8_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int8_t& val);
+template void HdfsParquetScanner::Le<int16_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int16_t& val);
+template void HdfsParquetScanner::Le<int32_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int32_t& val);
+template void HdfsParquetScanner::Le<int64_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int64_t& val);
+template void HdfsParquetScanner::Le<float>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, float& val);
+template void HdfsParquetScanner::Le<double>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, double& val);
+template void HdfsParquetScanner::Le<TimestampValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, TimestampValue& val);
+template void HdfsParquetScanner::Le<StringValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, StringValue& val);
+template void HdfsParquetScanner::Le<Decimal4Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal4Value& val);
+template void HdfsParquetScanner::Le<Decimal8Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal8Value& val);
+template void HdfsParquetScanner::Le<Decimal16Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal16Value& val);
+
+template void HdfsParquetScanner::Gt<int8_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int8_t& val);
+template void HdfsParquetScanner::Gt<int16_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int16_t& val);
+template void HdfsParquetScanner::Gt<int32_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int32_t& val);
+template void HdfsParquetScanner::Gt<int64_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int64_t& val);
+template void HdfsParquetScanner::Gt<float>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, float& val);
+template void HdfsParquetScanner::Gt<double>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, double& val);
+template void HdfsParquetScanner::Gt<TimestampValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, TimestampValue& val);
+template void HdfsParquetScanner::Gt<StringValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, StringValue& val);
+template void HdfsParquetScanner::Gt<Decimal4Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal4Value& val);
+template void HdfsParquetScanner::Gt<Decimal8Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal8Value& val);
+template void HdfsParquetScanner::Gt<Decimal16Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal16Value& val);
+
+template void HdfsParquetScanner::Ge<int8_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int8_t& val);
+template void HdfsParquetScanner::Ge<int16_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int16_t& val);
+template void HdfsParquetScanner::Ge<int32_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int32_t& val);
+template void HdfsParquetScanner::Ge<int64_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, int64_t& val);
+template void HdfsParquetScanner::Ge<float>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, float& val);
+template void HdfsParquetScanner::Ge<double>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, double& val);
+template void HdfsParquetScanner::Ge<TimestampValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, TimestampValue& val);
+template void HdfsParquetScanner::Ge<StringValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, StringValue& val);
+template void HdfsParquetScanner::Ge<Decimal4Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal4Value& val);
+template void HdfsParquetScanner::Ge<Decimal8Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal8Value& val);
+template void HdfsParquetScanner::Ge<Decimal16Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, Decimal16Value& val);
+
+template void HdfsParquetScanner::In<int8_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<int8_t>& val);
+template void HdfsParquetScanner::In<int16_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<int16_t>& val);
+template void HdfsParquetScanner::In<int32_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<int32_t>& val);
+template void HdfsParquetScanner::In<int64_t>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<int64_t>& val);
+template void HdfsParquetScanner::In<float>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<float>& val);
+template void HdfsParquetScanner::In<double>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<double>& val);
+template void HdfsParquetScanner::In<TimestampValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<TimestampValue>& val);
+template void HdfsParquetScanner::In<StringValue>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<StringValue>& val);
+template void HdfsParquetScanner::In<Decimal4Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<Decimal4Value>& val);
+template void HdfsParquetScanner::In<Decimal8Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<Decimal8Value>& val);
+template void HdfsParquetScanner::In<Decimal16Value>(int idx, int64_t num_rows,
+    boost::dynamic_bitset<>& skip_bitset, vector<Decimal16Value>& val);
+
+template class HdfsParquetScanner::ColumnReader<int8_t>;
+template class HdfsParquetScanner::ColumnReader<int16_t>;
+template class HdfsParquetScanner::ColumnReader<int32_t>;
+template class HdfsParquetScanner::ColumnReader<int64_t>;
+template class HdfsParquetScanner::ColumnReader<float>;
+template class HdfsParquetScanner::ColumnReader<double>;
+template class HdfsParquetScanner::ColumnReader<TimestampValue>;
+template class HdfsParquetScanner::ColumnReader<StringValue>;
+template class HdfsParquetScanner::ColumnReader<Decimal4Value>;
+template class HdfsParquetScanner::ColumnReader<Decimal8Value>;
+template class HdfsParquetScanner::ColumnReader<Decimal16Value>;
+

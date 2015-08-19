@@ -22,6 +22,7 @@
 #include "codegen/codegen-anyval.h"
 #include "codegen/llvm-codegen.h"
 #include "exprs/anyval-util.h"
+#include "exprs/decimal-operators.cc"
 #include "exprs/expr-context.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
@@ -727,6 +728,240 @@ DecimalVal ScalarFnCall::GetDecimalVal(ExprContext* context, TupleRow* row) {
   if (scalar_fn_wrapper_ == NULL) return InterpretEval<DecimalVal>(context, row);
   DecimalWrapper fn = reinterpret_cast<DecimalWrapper>(scalar_fn_wrapper_);
   return fn(context, row);
+}
+
+SimplePredicate* ScalarFnCall::CreateSimplePredicates(HdfsScanNode* scan_node) {
+  DCHECK_EQ(type_.type, TYPE_BOOLEAN);
+  SlotRef* slotref = NULL;
+  if (children_[0]->children_.size() == 1 && children_[0]->children_[0]->is_slotref()) {
+    slotref = static_cast<SlotRef*>(children_[0]->children_[0]);
+  }
+  if (children_[0]->is_slotref()) slotref = static_cast<SlotRef*>(children_[0]);
+  if (!slotref) return NULL;
+  if (children_[1]->is_slotref()) return NULL;
+
+  switch (children_[1]->type().type) {
+    case TYPE_BOOLEAN: {
+      return NULL;
+      break;
+    }
+    case TYPE_TINYINT: {
+      vector<int8_t> vals;
+      for (int i = 1; i < children_.size(); ++i) {
+        TinyIntVal v = static_cast<Literal*>(children_[i])->GetTinyIntVal(NULL, NULL);
+        vals.push_back(v.val);
+      }
+      return CreateOperate(scan_node, slotref, vals);
+      break;
+    }
+    case TYPE_SMALLINT: {
+      vector<int16_t> vals;
+      for (int i = 1; i < children_.size(); ++i) {
+        SmallIntVal v = static_cast<Literal*>(children_[i])->GetSmallIntVal(NULL, NULL);
+        vals.push_back(v.val);
+      }
+      return CreateOperate(scan_node, slotref, vals);
+      break;
+    }
+    case TYPE_INT: {
+      vector<int32_t> vals;
+      for (int i = 1; i < children_.size(); ++i) {
+        IntVal v = static_cast<Literal*>(children_[i])->GetIntVal(NULL, NULL);
+        vals.push_back(v.val);
+      }
+      return CreateOperate(scan_node, slotref, vals);
+      break;
+    }
+    case TYPE_BIGINT: {
+      vector<int64_t> vals;
+      for (int i = 1; i < children_.size(); ++i) {
+        BigIntVal v = static_cast<Literal*>(children_[i])->GetBigIntVal(NULL, NULL);
+        vals.push_back(v.val);
+      }
+      return CreateOperate(scan_node, slotref, vals);
+      break;
+    }
+    case TYPE_FLOAT: {
+      if (slotref->type().type == TYPE_DECIMAL) {
+        bool overflow = false;
+        switch (slotref->type().GetByteSize()) {
+          case 4: {
+            vector<Decimal4Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              FloatVal v = static_cast<Literal*>(children_[i])->GetFloatVal(NULL, NULL);
+              Decimal4Value dv = Decimal4Value::FromDouble(slotref->type(), v.val, &overflow);
+              vals.push_back(dv);
+            }
+            return CreateOperate(scan_node, slotref, vals);
+          }
+          case 8: {
+            vector<Decimal8Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              FloatVal v = static_cast<Literal*>(children_[i])->GetFloatVal(NULL, NULL);
+              Decimal8Value dv = Decimal8Value::FromDouble(slotref->type(), v.val, &overflow);
+              vals.push_back(dv);
+            }
+            return CreateOperate(scan_node, slotref, vals);
+          }
+          case 16: {
+            vector<Decimal16Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              FloatVal v = static_cast<Literal*>(children_[i])->GetFloatVal(NULL, NULL);
+              Decimal16Value dv = Decimal16Value::FromDouble(slotref->type(), v.val, &overflow);
+              vals.push_back(dv);
+            }
+            return CreateOperate(scan_node, slotref, vals);
+          }
+          default:
+            DCHECK(false);
+            return NULL;
+        }
+      } else {
+        vector<float> vals;
+        for (int i = 1; i < children_.size(); ++i) {
+          FloatVal v = static_cast<Literal*>(children_[i])->GetFloatVal(NULL, NULL);
+          vals.push_back(v.val);
+        }
+        return CreateOperate(scan_node, slotref, vals);
+      }
+      break;
+    }
+    case TYPE_DOUBLE: {
+      if (slotref->type().type == TYPE_DECIMAL) {
+        bool overflow = false;
+        switch (slotref->type().GetByteSize()) {
+          case 4: {
+            vector<Decimal4Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              DoubleVal v = static_cast<Literal*>(children_[i])->GetDoubleVal(NULL, NULL);
+              Decimal4Value dv = Decimal4Value::FromDouble(slotref->type(), v.val, &overflow);
+              vals.push_back(dv);
+            }
+            return CreateOperate(scan_node, slotref, vals);
+          }
+          case 8: {
+            vector<Decimal8Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              DoubleVal v = static_cast<Literal*>(children_[i])->GetDoubleVal(NULL, NULL);
+              Decimal8Value dv = Decimal8Value::FromDouble(slotref->type(), v.val, &overflow);
+              vals.push_back(dv);
+            }
+            return CreateOperate(scan_node, slotref, vals);
+          }
+          case 16: {
+            vector<Decimal16Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              DoubleVal v = static_cast<Literal*>(children_[i])->GetDoubleVal(NULL, NULL);
+              Decimal16Value dv = Decimal16Value::FromDouble(slotref->type(), v.val, &overflow);
+              vals.push_back(dv);
+            }
+            return CreateOperate(scan_node, slotref, vals);
+          }
+          default:
+            DCHECK(false);
+            return NULL;
+        }
+      } else {
+        vector<double> vals;
+        for (int i = 1; i < children_.size(); ++i) {
+          DoubleVal v = static_cast<Literal*>(children_[i])->GetDoubleVal(NULL, NULL);
+          vals.push_back(v.val);
+        }
+        return CreateOperate(scan_node, slotref, vals);
+      }
+      break;
+    }
+    case TYPE_STRING:
+    case TYPE_VARCHAR:
+    case TYPE_CHAR: {
+      vector<StringValue> vals;
+      for (int i = 1; i < children_.size(); ++i) {
+        StringVal v = static_cast<Literal*>(children_[i])->GetStringVal(NULL, NULL);
+        vals.push_back(StringValue::FromStringVal(v));
+      }
+      return CreateOperate(scan_node, slotref, vals);
+      break;
+    }
+    case TYPE_TIMESTAMP: {
+      vector<TimestampValue> vals;
+      for (int i = 1; i < children_.size(); ++i) {
+        TimestampVal v = static_cast<Literal*>(children_[i])->GetTimestampVal(NULL, NULL);
+        vals.push_back(TimestampValue::FromTimestampVal(v));
+      }
+      return CreateOperate(scan_node, slotref, vals);
+      break;
+    }
+    case TYPE_DECIMAL: {
+      bool overflow = false;
+      switch (slotref->type().GetByteSize()) {
+        case 4:
+          {
+            vector<Decimal4Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              DecimalVal v = static_cast<Literal*>(children_[i])->GetDecimalVal(NULL, NULL);
+              vals.push_back(GetDecimal4Value(v, children_[i]->type(), &overflow));
+            }
+            return CreateOperate(scan_node, slotref, vals);
+            break;
+          }
+        case 8:
+          {
+            vector<Decimal8Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              DecimalVal v = static_cast<Literal*>(children_[i])->GetDecimalVal(NULL, NULL);
+              vals.push_back(GetDecimal8Value(v, children_[i]->type(), &overflow));
+            }
+            return CreateOperate(scan_node, slotref, vals);
+            break;
+          }
+        case 16:
+          {
+            vector<Decimal16Value> vals;
+            for (int i = 1; i < children_.size(); ++i) {
+              DecimalVal v = static_cast<Literal*>(children_[i])->GetDecimalVal(NULL, NULL);
+              vals.push_back(GetDecimal16Value(v, children_[i]->type(), &overflow));
+            }
+            return CreateOperate(scan_node, slotref, vals);
+            break;
+          }
+        default:
+          DCHECK(false) << type_.DebugString();
+      }
+      break;
+    }
+    default:
+      DCHECK(false) << "Type not implemented: " << children_[1]->type().DebugString();
+      return NULL;
+  }
+}
+
+template<typename T>
+inline SimplePredicate* ScalarFnCall::CreateOperate(HdfsScanNode* scan_node, SlotRef* slotref, vector<T>& vals) {
+  SlotId slot_id = slotref->slot_id();
+  const SlotDescriptor* slot_desc = scan_node->runtime_state()->desc_tbl().GetSlotDescriptor(slot_id);
+  int slot_idx = scan_node->GetMaterializedSlotIdx(slot_desc->col_path());
+
+  SimplePredicate* operate = NULL;
+  if (fn_.name.function_name == "eq") {
+    if (children_.size() != 2) return NULL;
+    operate = scan_node->runtime_state()->obj_pool()->Add(new EqOperate<T>(slot_idx, vals[0]));
+  } else if (fn_.name.function_name == "gt") {
+    if (children_.size() != 2) return NULL;
+    operate = scan_node->runtime_state()->obj_pool()->Add(new GtOperate<T>(slot_idx, vals[0]));
+  } else if (fn_.name.function_name == "lt") {
+    if (children_.size() != 2) return NULL;
+    operate = scan_node->runtime_state()->obj_pool()->Add(new LtOperate<T>(slot_idx, vals[0]));
+  } else if (fn_.name.function_name == "ge") {
+    if (children_.size() != 2) return NULL;
+    operate = scan_node->runtime_state()->obj_pool()->Add(new GeOperate<T>(slot_idx, vals[0]));
+  } else if (fn_.name.function_name == "le") {
+    if (children_.size() != 2) return NULL;
+    operate = scan_node->runtime_state()->obj_pool()->Add(new LeOperate<T>(slot_idx, vals[0]));
+  } else if (fn_.name.function_name == "in_set_lookup") {
+    operate = scan_node->runtime_state()->obj_pool()->Add(new InOperate<T>(slot_idx, vals));
+  }
+
+  return operate;
 }
 
 string ScalarFnCall::DebugString() const {
